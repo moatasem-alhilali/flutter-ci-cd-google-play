@@ -1,0 +1,188 @@
+require 'json'
+require 'google/apis/androidpublisher_v3'
+require 'yaml'
+
+# ✅ 1. Function to get latest versionCode from Play Store
+def fetch_latest_version_code
+  begin
+    keyfile = File.expand_path("keys/play-store-service-account.json", __dir__)
+    
+    unless File.exist?(keyfile)
+      UI.error("Service account JSON file not found at #{keyfile}")
+      return 1
+    end
+    
+    json_key_io = File.open(keyfile)
+    scopes = ['https://www.googleapis.com/auth/androidpublisher']
+
+    authorizer = Google::Auth::ServiceAccountCredentials.make_creds(
+      json_key_io: json_key_io,
+      scope: scopes
+    )
+    authorizer.fetch_access_token!
+
+    android_publisher = Google::Apis::AndroidpublisherV3::AndroidPublisherService.new
+    android_publisher.authorization = authorizer
+
+    package_name = "com.example.company.app" # Replace with your actual package name
+
+    begin
+      # Start edit session
+      edit = android_publisher.insert_edit(package_name)
+      edit_id = edit.id
+
+      # Fetch tracks within that edit
+      tracks = android_publisher.list_edit_tracks(package_name, edit_id)
+      
+      # More defensive handling of nil values
+      version_codes = []
+      if tracks && tracks.tracks
+        version_codes = tracks.tracks.flat_map do |t| 
+          if t.releases
+            t.releases.flat_map { |r| r.version_codes || [] }
+          else
+            []
+          end
+        end.compact
+      end
+
+      # Clean up edit session
+      android_publisher.delete_edit(package_name, edit_id)
+
+      latest_code = version_codes.empty? ? 0 : version_codes.map(&:to_i).max
+      return latest_code > 0 ? latest_code : 1
+    rescue => e
+      UI.error("Error fetching version from Play Store: #{e.message}")
+      return 1
+    end
+  rescue => e
+    UI.error("Authentication error: #{e.message}")
+    return 1
+  ensure
+    json_key_io.close if json_key_io && !json_key_io.closed?
+  end
+end
+
+# ✅ 2. Function to bump pubspec.yaml versionCode
+def bump_pubspec_version_code
+  pubspec_path = File.expand_path("../../pubspec.yaml", __dir__)
+  
+  unless File.exist?(pubspec_path)
+    UI.error("Pubspec.yaml not found at #{pubspec_path}")
+    return false
+  end
+  
+  begin
+    # Get latest version from Play Store
+    play_store_version = fetch_latest_version_code
+    UI.message("Latest Play Store version code: #{play_store_version}")
+    
+    # Read the entire file
+    content = File.read(pubspec_path)
+    UI.message("Current content: #{content.lines.grep(/version:/).first.strip}")
+    
+    # Find the version line
+    version_line = content.lines.grep(/version:/).first
+    unless version_line
+      UI.error("Version line not found in pubspec.yaml")
+      return false
+    end
+    
+    UI.message("Found version line: #{version_line.strip}")
+    
+    # Extract version name and code
+    match = version_line.match(/version:\s*(\d+\.\d+\.\d+)(\+(\d+))?/)
+    unless match
+      UI.error("Failed to parse version from line: #{version_line}")
+      return false
+    end
+    
+    version_name = match[1]
+    current_code = match[3] ? match[3].to_i : 0
+    
+    UI.message("Current pubspec version: name=#{version_name}, code=#{current_code}")
+    
+    # Use the higher version between Play Store and pubspec
+    base_version = [play_store_version, current_code].max
+    next_code = base_version + 1
+    
+    UI.message("Using base version: #{base_version}")
+    UI.message("New version code will be: #{next_code}")
+    
+    # Skip update if version is already higher than what we'd set
+    if current_code >= next_code
+      UI.message("Current version code (#{current_code}) is already >= next code (#{next_code}). No update needed.")
+      return true
+    end
+    
+    # Create the new version line
+    new_version_line = "version: #{version_name}+#{next_code}\n"
+    
+    # Replace the version line in the content
+    new_content = content.gsub(version_line, new_version_line)
+    
+    if new_content == content
+      UI.error("Failed to update version code in pubspec.yaml")
+      return false
+    end
+    
+    # Write the updated content back to the file
+    File.write(pubspec_path, new_content)
+    
+    UI.success("✅ Bumped versionCode from #{current_code} to #{next_code}")
+    return true
+  rescue => e
+    UI.error("Error updating pubspec.yaml: #{e.message}")
+    UI.error(e.backtrace.join("\n"))
+    return false
+  end
+end
+
+# ✅ 3. Start Fastlane config
+default_platform(:android)
+
+platform :android do
+  desc "Deploy to Internal Testing"
+  lane :deploy_internal do
+    build_and_upload(track: "internal")
+  end
+
+  desc "Deploy to Alpha Track"
+  lane :deploy_alpha do
+    build_and_upload(track: "alpha")
+  end
+
+  desc "Deploy to Beta Track"
+  lane :deploy_beta do
+    build_and_upload(track: "beta")
+  end
+
+  desc "Deploy to Production"
+  lane :deploy_production do
+    build_and_upload(track: "production")
+  end
+
+  # ✅ 4. Core logic (call bump before gradle)
+  private_lane :build_and_upload do |options|
+    bump_pubspec_version_code     
+
+    gradle(
+      task: "bundle",
+      build_type: "Release",
+      properties: {
+      "android.injected.invoked.from.ide" => "true"
+     },
+      flags: "--warning-mode all"
+    )
+
+    upload_to_play_store(
+      track: options[:track],
+      aab: "../build/app/outputs/bundle/release/app-release.aab",
+      json_key: "fastlane/keys/play-store-service-account.json",
+      skip_upload_metadata: true,
+      skip_upload_changelogs: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+end
